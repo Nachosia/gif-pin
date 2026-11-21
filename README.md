@@ -17,8 +17,10 @@ Pin independent, floating, always-on-top media widgets — GIFs, images, and MP4
 3. Click **＋ Add Media** (or drag & drop files onto the hub) and pick `.gif`, `.mp4`, `.png`, `.jpg`, `.jpeg`, or `.webp` files.
 4. Each file spawns its own floating, always-on-top widget. Done.
 
-Closing the hub window minimizes it to the **system tray** — your overlays keep running.
-Left-click the tray icon to reopen the hub; the tray menu also offers Show/Hide All and Exit.
+Closing the hub window (**X**) minimizes it to the **system tray** — your overlays keep running.
+Left-click the tray icon (or **Show Hub** in its menu) to reopen the hub; the tray menu also offers
+Show/Hide All and **Exit**, which closes every overlay and quits the app completely. The hub footer
+has matching **Hide to Tray** and **Exit App** buttons.
 
 ### Widget controls
 

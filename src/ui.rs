@@ -1,14 +1,17 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetClassNameW, PostMessageW, SetWindowsHookExW, UnhookWindowsHookEx,
-    WindowFromPoint, HHOOK, MSLLHOOKSTRUCT, WH_MOUSE_LL, WM_MOUSEWHEEL,
+    CallNextHookEx, EnumWindows, GetClassNameW, GetWindowThreadProcessId, PostMessageW,
+    SetWindowsHookExW, UnhookWindowsHookEx, WindowFromPoint, HHOOK, MSLLHOOKSTRUCT, WH_MOUSE_LL,
+    WM_CLOSE, WM_MOUSEWHEEL,
 };
 
 use crate::media::{kind_from_path, Kind};
@@ -51,6 +54,123 @@ enum Pending {
     Bounds(u64, bool),
 }
 
+/// Cross-thread registry of live widgets, shared with the tray event threads
+/// (which must keep working while the hub window is hidden and egui sleeps).
+#[derive(Default)]
+struct Shared {
+    widgets: Vec<WidgetLink>,
+}
+
+struct WidgetLink {
+    id: u64,
+    hwnd: isize,
+    visible: bool,
+}
+
+static EXITING: AtomicBool = AtomicBool::new(false);
+
+fn show_hub(ctx: &egui::Context) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    ctx.request_repaint();
+}
+
+fn set_all_shared(shared: &Arc<Mutex<Shared>>, visible: bool) {
+    let s = shared.lock().unwrap();
+    for w in &s.widgets {
+        overlay::post_cmd(w.hwnd, if visible { CMD_SHOW } else { CMD_HIDE }, 0);
+    }
+    drop(s);
+    let mut s = shared.lock().unwrap();
+    for w in &mut s.widgets {
+        w.visible = visible;
+    }
+}
+
+/// Destroy our tray icon window so no ghost icon lingers in the hidden-icons
+/// area. TrayIcon is !Send (Rc-based), so instead of dropping it cross-thread
+/// we post WM_CLOSE to its hidden window; the main thread's message pump
+/// dispatches it (even while the hub is hidden) and tray-icon unregisters the
+/// shell icon (NIM_DELETE) during WM_DESTROY. The class name is shared by all
+/// tray-icon apps, so match strictly within our own process.
+fn remove_tray_icon() {
+    struct Search {
+        pid: u32,
+        found: HWND,
+    }
+    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let s = &mut *(lparam.0 as *mut Search);
+        let mut wpid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut wpid));
+        if wpid == s.pid {
+            let mut buf = [0u16; 64];
+            let n = GetClassNameW(hwnd, &mut buf);
+            if n > 0 && String::from_utf16_lossy(&buf[..n as usize]) == "tray_icon_app" {
+                s.found = hwnd;
+                return BOOL(0);
+            }
+        }
+        BOOL(1)
+    }
+    unsafe {
+        let mut search = Search {
+            pid: std::process::id(),
+            found: HWND::default(),
+        };
+        let _ = EnumWindows(Some(enum_proc), LPARAM(&mut search as *mut _ as isize));
+        if !search.found.is_invalid() {
+            let _ = PostMessageW(search.found, WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+/// Full clean shutdown, callable from the tray threads or the hub's Exit App
+/// button: close every overlay, remove the tray icon, exit within ~100ms.
+fn shutdown(shared: &Arc<Mutex<Shared>>) -> ! {
+    if EXITING.swap(true, Ordering::SeqCst) {
+        std::process::exit(0);
+    }
+    {
+        let s = shared.lock().unwrap();
+        for w in &s.widgets {
+            overlay::post_cmd(w.hwnd, CMD_CLOSE, 0);
+        }
+    }
+    remove_tray_icon();
+    // Give the UI thread time to dispatch WM_CLOSE and widget threads to run
+    // their WM_DESTROY cleanup before the process dies.
+    std::thread::sleep(Duration::from_millis(80));
+    std::process::exit(0);
+}
+
+fn tray_menu_thread(ctx: egui::Context, shared: Arc<Mutex<Shared>>) {
+    // Blocking recv(): works even when the hub is hidden and egui::update()
+    // is not being called.
+    while let Ok(ev) = MenuEvent::receiver().recv() {
+        match ev.id.0.as_str() {
+            "show" => show_hub(&ctx),
+            "show_all" => set_all_shared(&shared, true),
+            "hide_all" => set_all_shared(&shared, false),
+            "exit" => shutdown(&shared),
+            _ => {}
+        }
+    }
+}
+
+fn tray_click_thread(ctx: egui::Context) {
+    while let Ok(ev) = TrayIconEvent::receiver().recv() {
+        if let TrayIconEvent::Click {
+            button: tray_icon::MouseButton::Left,
+            button_state: tray_icon::MouseButtonState::Up,
+            ..
+        } = ev
+        {
+            show_hub(&ctx);
+        }
+    }
+}
+
 pub struct HubApp {
     entries: Vec<Entry>,
     next_id: u64,
@@ -64,6 +184,7 @@ pub struct HubApp {
     hook: Option<HHOOK>,
     status: Option<(String, Instant)>,
     title_font: egui::FontId,
+    shared: Arc<Mutex<Shared>>,
 }
 
 impl HubApp {
@@ -131,6 +252,23 @@ impl HubApp {
         let hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), None, 0) }.ok();
 
         let tray = build_tray();
+        let shared = Arc::new(Mutex::new(Shared::default()));
+
+        // Dedicated tray event threads: they block on the event channels and
+        // keep working while the hub window is hidden (egui stops updating).
+        let _ = std::thread::Builder::new()
+            .name("tray-menu".into())
+            .spawn({
+                let ctx = ctx.clone();
+                let shared = shared.clone();
+                move || tray_menu_thread(ctx, shared)
+            });
+        let _ = std::thread::Builder::new()
+            .name("tray-click".into())
+            .spawn({
+                let ctx = ctx.clone();
+                move || tray_click_thread(ctx)
+            });
 
         Self {
             entries: Vec::new(),
@@ -145,16 +283,12 @@ impl HubApp {
             hook,
             status: Some(("Ready. Add media to spawn floating overlays.".into(), Instant::now())),
             title_font,
+            shared,
         }
     }
 
     fn set_status(&mut self, msg: impl Into<String>) {
         self.status = Some((msg.into(), Instant::now()));
-    }
-
-    fn show_hub(&self, ctx: &egui::Context) {
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
     fn open_dialog(&mut self) {
@@ -215,6 +349,11 @@ impl HubApp {
         while let Ok(ev) = self.hub_rx.try_recv() {
             match ev {
                 HubEvent::Created(info) => {
+                    self.shared.lock().unwrap().widgets.push(WidgetLink {
+                        id: info.id,
+                        hwnd: info.hwnd,
+                        visible: true,
+                    });
                     if let Some(e) = self.entries.iter_mut().find(|e| e.id == info.id) {
                         e.info = Some(info);
                     }
@@ -225,6 +364,7 @@ impl HubApp {
                     }
                 }
                 HubEvent::Closed { id } => {
+                    self.shared.lock().unwrap().widgets.retain(|w| w.id != id);
                     self.entries.retain(|e| e.id != id || e.failed.is_some());
                 }
                 HubEvent::Opacity { id, value } => {
@@ -250,27 +390,13 @@ impl HubApp {
         }
     }
 
-    fn poll_tray(&mut self, ctx: &egui::Context) {
-        while let Ok(ev) = MenuEvent::receiver().try_recv() {
-            match ev.id.0.as_str() {
-                "show" => self.show_hub(ctx),
-                "show_all" => self.set_all_visible(true),
-                "hide_all" => self.set_all_visible(false),
-                "exit" => {
-                    self.close_all();
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    fn reconcile_visible(&mut self) {
+        let s = self.shared.lock().unwrap();
+        for e in &mut self.entries {
+            if let Some(info) = &e.info {
+                if let Some(w) = s.widgets.iter().find(|w| w.id == info.id) {
+                    e.visible = w.visible;
                 }
-                _ => {}
-            }
-        }
-        while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
-            if let TrayIconEvent::Click {
-                button: tray_icon::MouseButton::Left,
-                button_state: tray_icon::MouseButtonState::Up,
-                ..
-            } = ev
-            {
-                self.show_hub(ctx);
             }
         }
     }
@@ -286,6 +412,10 @@ impl HubApp {
                 );
             }
         }
+        let mut s = self.shared.lock().unwrap();
+        for w in &mut s.widgets {
+            w.visible = visible;
+        }
     }
 
     fn close_all(&mut self) {
@@ -295,6 +425,7 @@ impl HubApp {
             }
         }
         self.entries.clear();
+        self.shared.lock().unwrap().widgets.clear();
         self.set_status("All widgets closed.");
     }
 
@@ -308,6 +439,7 @@ impl HubApp {
                             overlay::post_cmd(info.hwnd, CMD_CLOSE, 0);
                         }
                     }
+                    self.shared.lock().unwrap().widgets.retain(|w| w.id != id);
                 }
                 Pending::Visible(id, v) => {
                     if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
@@ -315,6 +447,16 @@ impl HubApp {
                         if let Some(info) = &e.info {
                             overlay::post_cmd(info.hwnd, if v { CMD_SHOW } else { CMD_HIDE }, 0);
                         }
+                    }
+                    if let Some(w) = self
+                        .shared
+                        .lock()
+                        .unwrap()
+                        .widgets
+                        .iter_mut()
+                        .find(|w| w.id == id)
+                    {
+                        w.visible = v;
                     }
                 }
                 Pending::Mute(id, m) => {
@@ -373,7 +515,7 @@ impl HubApp {
 impl eframe::App for HubApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_events();
-        self.poll_tray(ctx);
+        self.reconcile_visible();
 
         if ctx.input(|i| i.viewport().close_requested()) {
             // Close button minimizes to tray; overlays keep running.
@@ -646,6 +788,13 @@ impl eframe::App for HubApp {
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("Exit App")
+                        .on_hover_text("Close all overlays and exit GIF Pin")
+                        .clicked()
+                    {
+                        shutdown(&self.shared);
+                    }
                     if ui.small_button("Hide to Tray").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                     }
