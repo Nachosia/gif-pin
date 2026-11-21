@@ -24,7 +24,7 @@ fn main() -> eframe::Result<()> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([440.0, 680.0])
             .with_min_inner_size([400.0, 520.0])
-            .with_title("GIF Pin — Overlay Hub"),
+            .with_title(gif_pin::ui::HUB_TITLE),
         ..Default::default()
     };
 

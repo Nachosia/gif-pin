@@ -1145,11 +1145,12 @@ dependencies = [
 
 [[package]]
 name = "gif-pin"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "eframe",
  "fast_image_resize",
  "image",
+ "raw-window-handle",
  "rfd",
  "tray-icon",
  "windows",

@@ -1,17 +1,22 @@
+use std::ffi::c_void;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, EnumWindows, GetClassNameW, GetWindowThreadProcessId, PostMessageW,
-    SetWindowsHookExW, UnhookWindowsHookEx, WindowFromPoint, HHOOK, MSLLHOOKSTRUCT, WH_MOUSE_LL,
-    WM_CLOSE, WM_MOUSEWHEEL,
+    CallNextHookEx, EnumWindows, FindWindowW, GetClassNameW, GetWindowThreadProcessId,
+    PostMessageW, SetForegroundWindow, SetWindowPos, SetWindowsHookExW, ShowWindow,
+    UnhookWindowsHookEx, WindowFromPoint, HHOOK, HWND_NOTOPMOST, HWND_TOPMOST, MSLLHOOKSTRUCT,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_RESTORE, SW_SHOW, WH_MOUSE_LL, WM_CLOSE,
+    WM_MOUSEWHEEL,
 };
 
 use crate::media::{kind_from_path, Kind};
@@ -27,6 +32,10 @@ const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x60, 0xcd, 0xff);
 const DIM: egui::Color32 = egui::Color32::from_rgb(0x9a, 0x9a, 0xa8);
 const TEXT: egui::Color32 = egui::Color32::from_rgb(0xe8, 0xe8, 0xf0);
 const RED: egui::Color32 = egui::Color32::from_rgb(0xff, 0x7b, 0x72);
+
+/// Exact hub window title (also used by main.rs); the FindWindowW fallback
+/// for locating the native HWND matches on it.
+pub const HUB_TITLE: &str = "GIF Pin — Overlay Hub";
 
 struct Entry {
     id: u64,
@@ -69,7 +78,53 @@ struct WidgetLink {
 
 static EXITING: AtomicBool = AtomicBool::new(false);
 
-fn show_hub(ctx: &egui::Context) {
+/// Native hub window handle + wake flag, shared with the tray threads.
+#[derive(Default)]
+struct HubWake {
+    hwnd: AtomicIsize,
+    show_requested: AtomicBool,
+}
+
+/// Restore the hidden hub. egui viewport commands alone do not wake a hidden
+/// eframe window's message loop, so show/foreground the native HWND directly
+/// from this (background) thread, then sync egui state and force a repaint.
+fn show_hub(ctx: &egui::Context, wake: &Arc<HubWake>) {
+    unsafe {
+        let mut hwnd = HWND(wake.hwnd.load(Ordering::Relaxed) as *mut c_void);
+        if hwnd.is_invalid() {
+            let title = crate::win32_utils::wide(HUB_TITLE);
+            hwnd = FindWindowW(None, PCWSTR(title.as_ptr())).unwrap_or_default();
+            if !hwnd.is_invalid() {
+                wake.hwnd.store(hwnd.0 as isize, Ordering::Relaxed);
+            }
+        }
+        if !hwnd.is_invalid() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            // Windows may block SetForegroundWindow from a background thread;
+            // the brief TOPMOST -> NOTOPMOST toggle grants foreground rights.
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_NOTOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            let _ = SetForegroundWindow(hwnd);
+        }
+    }
+    wake.show_requested.store(true, Ordering::SeqCst);
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -144,12 +199,12 @@ fn shutdown(shared: &Arc<Mutex<Shared>>) -> ! {
     std::process::exit(0);
 }
 
-fn tray_menu_thread(ctx: egui::Context, shared: Arc<Mutex<Shared>>) {
+fn tray_menu_thread(ctx: egui::Context, shared: Arc<Mutex<Shared>>, wake: Arc<HubWake>) {
     // Blocking recv(): works even when the hub is hidden and egui::update()
     // is not being called.
     while let Ok(ev) = MenuEvent::receiver().recv() {
         match ev.id.0.as_str() {
-            "show" => show_hub(&ctx),
+            "show" => show_hub(&ctx, &wake),
             "show_all" => set_all_shared(&shared, true),
             "hide_all" => set_all_shared(&shared, false),
             "exit" => shutdown(&shared),
@@ -158,15 +213,19 @@ fn tray_menu_thread(ctx: egui::Context, shared: Arc<Mutex<Shared>>) {
     }
 }
 
-fn tray_click_thread(ctx: egui::Context) {
+fn tray_click_thread(ctx: egui::Context, wake: Arc<HubWake>) {
     while let Ok(ev) = TrayIconEvent::receiver().recv() {
-        if let TrayIconEvent::Click {
-            button: tray_icon::MouseButton::Left,
-            button_state: tray_icon::MouseButtonState::Up,
-            ..
-        } = ev
-        {
-            show_hub(&ctx);
+        match ev {
+            TrayIconEvent::Click {
+                button: tray_icon::MouseButton::Left,
+                button_state: tray_icon::MouseButtonState::Up,
+                ..
+            }
+            | TrayIconEvent::DoubleClick {
+                button: tray_icon::MouseButton::Left,
+                ..
+            } => show_hub(&ctx, &wake),
+            _ => {}
         }
     }
 }
@@ -185,6 +244,7 @@ pub struct HubApp {
     status: Option<(String, Instant)>,
     title_font: egui::FontId,
     shared: Arc<Mutex<Shared>>,
+    wake: Arc<HubWake>,
 }
 
 impl HubApp {
@@ -253,6 +313,15 @@ impl HubApp {
 
         let tray = build_tray();
         let shared = Arc::new(Mutex::new(Shared::default()));
+        let wake = Arc::new(HubWake::default());
+
+        // Capture the hub's native HWND straight from eframe (exact, no
+        // title matching needed); the tray threads fall back to FindWindowW.
+        if let Ok(handle) = cc.window_handle() {
+            if let RawWindowHandle::Win32(w) = handle.as_raw() {
+                wake.hwnd.store(w.hwnd.get(), Ordering::Relaxed);
+            }
+        }
 
         // Dedicated tray event threads: they block on the event channels and
         // keep working while the hub window is hidden (egui stops updating).
@@ -261,13 +330,15 @@ impl HubApp {
             .spawn({
                 let ctx = ctx.clone();
                 let shared = shared.clone();
-                move || tray_menu_thread(ctx, shared)
+                let wake = wake.clone();
+                move || tray_menu_thread(ctx, shared, wake)
             });
         let _ = std::thread::Builder::new()
             .name("tray-click".into())
             .spawn({
                 let ctx = ctx.clone();
-                move || tray_click_thread(ctx)
+                let wake = wake.clone();
+                move || tray_click_thread(ctx, wake)
             });
 
         Self {
@@ -284,6 +355,7 @@ impl HubApp {
             status: Some(("Ready. Add media to spawn floating overlays.".into(), Instant::now())),
             title_font,
             shared,
+            wake,
         }
     }
 
@@ -514,6 +586,11 @@ impl HubApp {
 
 impl eframe::App for HubApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // A tray thread restored the native window; sync egui's viewport state.
+        if self.wake.show_requested.swap(false, Ordering::SeqCst) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        }
         self.poll_events();
         self.reconcile_visible();
 
