@@ -7,12 +7,12 @@ Pin independent, floating, always-on-top media widgets — GIFs, images, and MP4
 
 - **True Per-Pixel Transparency** — transparent `.gif` and `.png` files float cleanly over games, browsers, and desktop windows with zero background boxes or window borders (layered windows with `UpdateLayeredWindow` / `ULW_ALPHA`).
 - **Multi-Format Support** — smooth looping `.gif`, hardware-accelerated `.mp4` (via native Windows Media Foundation), `.png`, `.jpg`, `.jpeg`, and `.webp`.
-- **Effortless Controls** — drag anywhere to move (multi-monitor & DPI-aware), proportional corner resizing (hold `Shift` for free stretch) + mouse-wheel scaling, per-widget opacity slider (10%–100%), click-through lock mode, and System Tray integration.
+- **Effortless Controls** — drag anywhere to move (multi-monitor & DPI-aware), proportional corner resizing with a per-widget **Aspect Ratio Lock** toggle (hold `Shift` for a temporary free stretch), mouse-wheel scaling, per-widget opacity slider (10%–100%), click-through lock mode, a **Show Bounds** edit frame for grabbing fully transparent images, and System Tray integration.
 - **Zero Dependencies** — compiles into a single standalone `gif-pin.exe` (~5 MB). No FFmpeg, no OpenCV, no Python, no runtime installs.
 
 ## Quick Start
 
-1. Download or build `gif-pin.exe` (see below).
+1. Download `gif-pin.exe` from the [**Releases**](https://github.com/Nachosia/gif-pin/releases) page (or build from source below).
 2. Run it — the **Overlay Hub** opens.
 3. Click **＋ Add Media** (or drag & drop files onto the hub) and pick `.gif`, `.mp4`, `.png`, `.jpg`, `.jpeg`, or `.webp` files.
 4. Each file spawns its own floating, always-on-top widget. Done.
@@ -26,7 +26,9 @@ Left-click the tray icon to reopen the hub; the tray menu also offers Show/Hide 
 |---|---|
 | Move | Left-drag anywhere on the widget |
 | Scale | Mouse wheel over the widget (aspect preserved) |
-| Resize | Drag a corner handle (appears on hover); hold `Shift` for free stretch |
+| Resize | Drag a corner handle (appears on hover); proportional by default |
+| Aspect ratio | Hub **Ratio: On/Off** button or right-click **Lock Aspect Ratio** check item; hold `Shift` while dragging for a temporary free stretch |
+| Show Bounds | Hub **Bounds: On/Off** button or right-click **Show Bounds** check item — draws a subtle backdrop + accent border so fully transparent GIFs/PNGs can be grabbed by the corners |
 | Opacity | Slider in the hub, or right-click menu on the widget (10–100%) |
 | Pause / Resume | Hub button or right-click menu (GIF / MP4) |
 | Mute / Unmute | Hub button (MP4; widgets start muted) |
@@ -74,6 +76,7 @@ surface, and COM references; all of them are released when the widget closes.
 
 ## Notes
 
+- **Resizing transparent images:** Windows passes mouse clicks through pixels with `alpha == 0`, so the empty corners of a transparent GIF/PNG can't be grabbed directly. Enable **Show Bounds** (hub button or right-click menu) to composite a faint backdrop with `alpha > 0` across the whole bounding box plus an accent border and always-visible corner handles; toggle it off to float cleanly again.
 - MP4 audio plays through the Windows audio renderer sink; widgets start **muted** — unmute from the hub.
 - Codecs without a Media Foundation decoder (e.g. HEVC without the Windows extension) show an error in the hub instead of failing silently.
 - Animated `.webp` is displayed as its first frame.

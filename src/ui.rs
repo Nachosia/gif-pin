@@ -13,8 +13,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::media::{kind_from_path, Kind};
 use crate::overlay::{
-    self, HubEvent, WidgetInfo, CMD_CLOSE, CMD_HIDE, CMD_SET_LOCKED, CMD_SET_MUTED,
-    CMD_SET_OPACITY, CMD_SET_PAUSED, CMD_SHOW, WIDGET_CLASS,
+    self, HubEvent, WidgetInfo, CMD_CLOSE, CMD_HIDE, CMD_SET_ASPECT_LOCK, CMD_SET_LOCKED,
+    CMD_SET_MUTED, CMD_SET_OPACITY, CMD_SET_PAUSED, CMD_SET_SHOW_BOUNDS, CMD_SHOW, WIDGET_CLASS,
 };
 
 const BG: egui::Color32 = egui::Color32::from_rgb(0x15, 0x15, 0x1c);
@@ -36,6 +36,8 @@ struct Entry {
     locked: bool,
     paused: bool,
     opacity: u8,
+    lock_aspect: bool,
+    show_bounds: bool,
 }
 
 enum Pending {
@@ -45,6 +47,8 @@ enum Pending {
     Pause(u64, bool),
     Lock(u64, bool),
     Opacity(u64, u8),
+    Aspect(u64, bool),
+    Bounds(u64, bool),
 }
 
 pub struct HubApp {
@@ -195,6 +199,8 @@ impl HubApp {
                 locked: false,
                 paused: false,
                 opacity: 100,
+                lock_aspect: true,
+                show_bounds: false,
             });
             overlay::spawn_widget(id, path, self.hub_tx.clone(), self.cascade);
             self.cascade = self.cascade.wrapping_add(1);
@@ -224,6 +230,16 @@ impl HubApp {
                 HubEvent::Opacity { id, value } => {
                     if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
                         e.opacity = value;
+                    }
+                }
+                HubEvent::AspectLock { id, value } => {
+                    if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
+                        e.lock_aspect = value;
+                    }
+                }
+                HubEvent::Bounds { id, value } => {
+                    if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
+                        e.show_bounds = value;
                     }
                 }
             }
@@ -330,6 +346,22 @@ impl HubApp {
                         e.opacity = v;
                         if let Some(info) = &e.info {
                             overlay::post_cmd(info.hwnd, CMD_SET_OPACITY, v as isize);
+                        }
+                    }
+                }
+                Pending::Aspect(id, l) => {
+                    if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
+                        e.lock_aspect = l;
+                        if let Some(info) = &e.info {
+                            overlay::post_cmd(info.hwnd, CMD_SET_ASPECT_LOCK, l as isize);
+                        }
+                    }
+                }
+                Pending::Bounds(id, b) => {
+                    if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
+                        e.show_bounds = b;
+                        if let Some(info) = &e.info {
+                            overlay::post_cmd(info.hwnd, CMD_SET_SHOW_BOUNDS, b as isize);
                         }
                     }
                 }
@@ -552,9 +584,39 @@ impl eframe::App for HubApp {
                                         {
                                             pending.push(Pending::Lock(entry.id, !entry.locked));
                                         }
+                                        let label = if entry.lock_aspect {
+                                            "Ratio: On"
+                                        } else {
+                                            "Ratio: Off"
+                                        };
+                                        if ui
+                                            .add_sized([72.0, 24.0], egui::Button::new(label).small())
+                                            .on_hover_text("Lock / Unlock Aspect Ratio")
+                                            .clicked()
+                                        {
+                                            pending.push(Pending::Aspect(
+                                                entry.id,
+                                                !entry.lock_aspect,
+                                            ));
+                                        }
                                     });
                                     ui.add_space(2.0);
                                     ui.horizontal(|ui| {
+                                        let label = if entry.show_bounds {
+                                            "Bounds: On"
+                                        } else {
+                                            "Bounds: Off"
+                                        };
+                                        if ui
+                                            .add_sized([78.0, 24.0], egui::Button::new(label).small())
+                                            .on_hover_text("Show/Hide bounding frame so transparent images can be easily resized by corners")
+                                            .clicked()
+                                        {
+                                            pending.push(Pending::Bounds(
+                                                entry.id,
+                                                !entry.show_bounds,
+                                            ));
+                                        }
                                         ui.label(
                                             egui::RichText::new("Opacity").size(11.0).color(DIM),
                                         );

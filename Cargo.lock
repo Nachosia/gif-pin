@@ -1145,7 +1145,7 @@ dependencies = [
 
 [[package]]
 name = "gif-pin"
-version = "0.1.0"
+version = "1.0.1"
 dependencies = [
  "eframe",
  "fast_image_resize",

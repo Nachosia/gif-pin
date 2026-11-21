@@ -51,6 +51,8 @@ pub const CMD_CLOSE: usize = 5;
 pub const CMD_SET_OPACITY: usize = 6;
 pub const CMD_SET_PAUSED: usize = 7;
 pub const CMD_RESET_SIZE: usize = 8;
+pub const CMD_SET_ASPECT_LOCK: usize = 9;
+pub const CMD_SET_SHOW_BOUNDS: usize = 10;
 
 pub struct WidgetInfo {
     pub id: u64,
@@ -65,6 +67,8 @@ pub enum HubEvent {
     Failed { id: u64, error: String },
     Closed { id: u64 },
     Opacity { id: u64, value: u8 },
+    AspectLock { id: u64, value: bool },
+    Bounds { id: u64, value: bool },
 }
 
 pub fn post_cmd(hwnd: isize, cmd: usize, val: isize) {
@@ -130,6 +134,8 @@ struct Widget {
     visible: bool,
     paused: bool,
     locked: bool,
+    lock_aspect_ratio: bool,
+    show_bounds: bool,
     hovered: bool,
     tracking: bool,
     surface: LayeredSurface,
@@ -219,6 +225,8 @@ fn run_widget(
             visible: false,
             paused: false,
             locked: false,
+            lock_aspect_ratio: true,
+            show_bounds: false,
             hovered: false,
             tracking: false,
             surface,
@@ -285,10 +293,16 @@ fn present(w: &Widget) {
 
 fn blit_current(w: &mut Widget) {
     let (fw, fh) = (w.media.width, w.media.height);
+    let scale = win32_utils::dpi_scale(w.hwnd);
     let bytes = w.surface.bytes();
     win32_utils::blit_frame(w.media.frame(), fw, fh, bytes, w.w as u32, w.h as u32);
-    if w.hovered && !w.locked {
-        win32_utils::draw_corner_handles(bytes, w.w, w.h, win32_utils::dpi_scale(w.hwnd));
+    if w.show_bounds {
+        // Alpha > 0 across the whole bbox: Windows hit-tests transparent
+        // corners again, so they can be grabbed for resizing.
+        win32_utils::draw_bounds_frame(bytes, w.w, w.h, scale);
+        win32_utils::draw_corner_handles(bytes, w.w, w.h, scale);
+    } else if w.hovered && !w.locked {
+        win32_utils::draw_corner_handles(bytes, w.w, w.h, scale);
     }
 }
 
@@ -345,13 +359,15 @@ fn dismiss_menu(w: &mut Widget) {
     }
 }
 
-/// Keep an open right-click menu's slider in sync with hub-driven opacity changes.
-fn sync_menu_opacity(w: &Widget) {
+/// Keep an open right-click menu in sync with hub-driven state changes.
+fn sync_menu_state(w: &Widget) {
     if let Some(mhwnd) = w.menu {
         let ptr = unsafe { GetWindowLongPtrW(mhwnd, GWLP_USERDATA) } as *mut Menu;
         if !ptr.is_null() {
             unsafe {
                 (*ptr).opacity = w.opacity;
+                (*ptr).lock_aspect = w.lock_aspect_ratio;
+                (*ptr).show_bounds = w.show_bounds;
                 render_menu(&mut *ptr);
             }
         }
@@ -424,11 +440,17 @@ pub fn compute_resize(
     (nx, ny, nw, nh)
 }
 
+/// Corner-drag stretch mode: free when the per-widget ratio lock is off,
+/// or while Shift temporarily overrides the lock.
+pub fn resize_is_free(lock_aspect_ratio: bool, shift_held: bool) -> bool {
+    !lock_aspect_ratio || shift_held
+}
+
 fn do_resize(w: &mut Widget, r: ResizeDrag) {
     unsafe {
         let mut cur = POINT::default();
         let _ = GetCursorPos(&mut cur);
-        let free = GetKeyState(VK_SHIFT.0 as i32) < 0;
+        let free = resize_is_free(w.lock_aspect_ratio, GetKeyState(VK_SHIFT.0 as i32) < 0);
         let (nx, ny, nw, nh) = compute_resize(
             r.corner,
             r.anchor_x,
@@ -680,10 +702,27 @@ unsafe extern "system" fn widget_wndproc(
                 CMD_SET_OPACITY => {
                     w.opacity = (lparam.0 as u8).clamp(10, 100);
                     present(w);
-                    sync_menu_opacity(w);
+                    sync_menu_state(w);
                     let _ = w.hub_tx.send(HubEvent::Opacity {
                         id: w.id,
                         value: w.opacity,
+                    });
+                }
+                CMD_SET_ASPECT_LOCK => {
+                    w.lock_aspect_ratio = lparam.0 != 0;
+                    sync_menu_state(w);
+                    let _ = w.hub_tx.send(HubEvent::AspectLock {
+                        id: w.id,
+                        value: w.lock_aspect_ratio,
+                    });
+                }
+                CMD_SET_SHOW_BOUNDS => {
+                    w.show_bounds = lparam.0 != 0;
+                    render(w);
+                    sync_menu_state(w);
+                    let _ = w.hub_tx.send(HubEvent::Bounds {
+                        id: w.id,
+                        value: w.show_bounds,
                     });
                 }
                 CMD_SET_PAUSED => {
@@ -733,6 +772,8 @@ unsafe extern "system" fn widget_wndproc(
 #[derive(Clone, Copy, PartialEq)]
 enum MenuAction {
     Pause,
+    AspectLock,
+    Bounds,
     Lock,
     Reset,
     Close,
@@ -750,6 +791,8 @@ struct Menu {
     name: String,
     opacity: u8,
     paused: bool,
+    lock_aspect: bool,
+    show_bounds: bool,
     w: i32,
     h: i32,
     scale: f32,
@@ -783,6 +826,16 @@ fn open_menu(w: &mut Widget) {
                 label: if w.paused { "Resume playback" } else { "Pause playback" }.into(),
             });
         }
+        items.push(MenuItem {
+            rect: RECT::default(),
+            action: MenuAction::AspectLock,
+            label: "Lock Aspect Ratio".into(),
+        });
+        items.push(MenuItem {
+            rect: RECT::default(),
+            action: MenuAction::Bounds,
+            label: "Show Bounds".into(),
+        });
         items.push(MenuItem {
             rect: RECT::default(),
             action: MenuAction::Lock,
@@ -848,6 +901,8 @@ fn open_menu(w: &mut Widget) {
             name: window_title(w),
             opacity: w.opacity,
             paused: w.paused,
+            lock_aspect: w.lock_aspect_ratio,
+            show_bounds: w.show_bounds,
             w: mw,
             h: mh,
             scale,
@@ -979,7 +1034,16 @@ fn render_menu(m: &mut Menu) {
                 FillRect(dc, &hr, hover_brush);
             }
             SetTextColor(dc, COLORREF(0x00F0E6E6));
-            let mut text = win32_utils::wide(&item.label);
+            let checked = match item.action {
+                MenuAction::AspectLock => Some(m.lock_aspect),
+                MenuAction::Bounds => Some(m.show_bounds),
+                _ => None,
+            };
+            let label = match checked {
+                Some(c) => format!("{}  {}", if c { "✓" } else { " " }, item.label),
+                None => item.label.clone(),
+            };
+            let mut text = win32_utils::wide(&label);
             let mut trc = RECT {
                 left: item.rect.left + (6.0 * m.scale) as i32,
                 top: item.rect.top,
@@ -1108,11 +1172,26 @@ unsafe extern "system" fn menu_wndproc(
                 let h = menu_hit_item(m, cx, cy);
                 if h >= 0 {
                     let action = m.items[h as usize].action;
+                    if action == MenuAction::AspectLock || action == MenuAction::Bounds {
+                        // Toggle in place: keep the menu open, refresh the checkmark.
+                        let (cmd, val) = if action == MenuAction::AspectLock {
+                            m.lock_aspect = !m.lock_aspect;
+                            (CMD_SET_ASPECT_LOCK, m.lock_aspect as isize)
+                        } else {
+                            m.show_bounds = !m.show_bounds;
+                            (CMD_SET_SHOW_BOUNDS, m.show_bounds as isize)
+                        };
+                        let _ = PostMessageW(m.parent, WM_WIDGET_CMD, WPARAM(cmd), LPARAM(val));
+                        render_menu(m);
+                        return LRESULT(0);
+                    }
                     let (cmd, val) = match action {
                         MenuAction::Pause => (CMD_SET_PAUSED, if m.paused { 0 } else { 1 }),
                         MenuAction::Lock => (CMD_SET_LOCKED, 1),
                         MenuAction::Reset => (CMD_RESET_SIZE, 0),
                         MenuAction::Close => (CMD_CLOSE, 0),
+                        MenuAction::AspectLock => (CMD_SET_ASPECT_LOCK, m.lock_aspect as isize),
+                        MenuAction::Bounds => (CMD_SET_SHOW_BOUNDS, m.show_bounds as isize),
                     };
                     let _ = PostMessageW(m.parent, WM_WIDGET_CMD, WPARAM(cmd), LPARAM(val));
                     menu_dismiss(m);
@@ -1154,5 +1233,33 @@ unsafe extern "system" fn menu_wndproc(
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compute_resize, resize_is_free};
+
+    #[test]
+    fn aspect_lock_decision_matrix() {
+        assert!(!resize_is_free(true, false), "locked, no Shift -> proportional");
+        assert!(resize_is_free(true, true), "Shift overrides the lock");
+        assert!(resize_is_free(false, false), "unlocked -> free without Shift");
+        assert!(resize_is_free(false, true));
+    }
+
+    #[test]
+    fn unlocked_corner_drag_stretches_freely_without_shift() {
+        let free = resize_is_free(false, false);
+        let (x, y, w, h) = compute_resize(3, 100, 100, 600, 237, 300, 150, 2.0, free);
+        assert_eq!((w, h), (500, 137), "independent width & height");
+        assert_eq!((x, y), (100, 100), "anchor corner stays put");
+    }
+
+    #[test]
+    fn locked_corner_drag_keeps_proportions() {
+        let free = resize_is_free(true, false);
+        let (_, _, w, h) = compute_resize(3, 0, 0, 600, 237, 300, 150, 2.0, free);
+        assert_eq!((w, h), (600, 300), "2:1 media stays 2:1");
     }
 }

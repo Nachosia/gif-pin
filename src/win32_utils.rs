@@ -233,6 +233,31 @@ fn fill_rect(dst: &mut [u8], w: i32, h: i32, x: i32, y: i32, rw: i32, rh: i32, c
     }
 }
 
+/// "Show Bounds" edit frame: a translucent RGBA(20,20,25,35) backdrop composited
+/// over the whole widget plus a 1-2px #60CDFF perimeter border. The backdrop
+/// guarantees alpha > 0 on every pixel, so Windows hit-tests the full bounding
+/// box (including fully transparent media corners) and they can be grabbed.
+pub fn draw_bounds_frame(dst: &mut [u8], w: i32, h: i32, scale: f32) {
+    let a = 35u32;
+    let inv = 255 - a;
+    let sr = (20 * a + 127) / 255;
+    let sg = (20 * a + 127) / 255;
+    let sb = (25 * a + 127) / 255;
+    for px in dst.chunks_exact_mut(4) {
+        // premultiplied "src over dst"
+        px[0] = (sb + px[0] as u32 * inv / 255).min(255) as u8;
+        px[1] = (sg + px[1] as u32 * inv / 255).min(255) as u8;
+        px[2] = (sr + px[2] as u32 * inv / 255).min(255) as u8;
+        px[3] = (a + px[3] as u32 * inv / 255).min(255) as u8;
+    }
+    let th = if scale > 1.5 { 2 } else { 1 };
+    let accent = [255, 205, 96, 255]; // #60CDFF, premultiplied BGRA (opaque)
+    fill_rect(dst, w, h, 0, 0, w, th, accent);
+    fill_rect(dst, w, h, 0, h - th, w, th, accent);
+    fill_rect(dst, w, h, 0, 0, th, h, accent);
+    fill_rect(dst, w, h, w - th, 0, th, h, accent);
+}
+
 /// Subtle L-shaped corner resize handles (premultiplied near-white).
 pub fn draw_corner_handles(dst: &mut [u8], w: i32, h: i32, scale: f32) {
     let len = ((14.0 * scale) as i32).max(6);
@@ -252,5 +277,34 @@ pub fn draw_corner_handles(dst: &mut [u8], w: i32, h: i32, scale: f32) {
         let vx = if sx > 0 { cx } else { cx - th };
         let vy = if sy > 0 { cy } else { cy - len };
         fill_rect(dst, w, h, vx, vy, th, len, c);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounds_frame_makes_transparent_pixels_hit_testable() {
+        let mut buf = vec![0u8; 4 * 4 * 4]; // fully transparent media
+        draw_bounds_frame(&mut buf, 4, 4, 1.0);
+        assert!(
+            buf.chunks_exact(4).all(|p| p[3] >= 35),
+            "every pixel must have alpha > 0 for Windows hit-testing"
+        );
+        assert_eq!(&buf[0..4], &[255, 205, 96, 255], "accent border corner");
+        let interior = (4 + 1) * 4;
+        assert_eq!(buf[interior + 3], 35, "interior keeps the subtle backdrop alpha");
+    }
+
+    #[test]
+    fn bounds_frame_preserves_opaque_media() {
+        let mut buf = vec![0u8; 2 * 2 * 4];
+        for px in buf.chunks_exact_mut(4) {
+            px.copy_from_slice(&[10, 20, 30, 255]);
+        }
+        draw_bounds_frame(&mut buf, 2, 2, 1.0);
+        // 2x2 with 1px border: every pixel is border -> opaque accent
+        assert!(buf.chunks_exact(4).all(|p| p[3] == 255));
     }
 }
