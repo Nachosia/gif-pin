@@ -1,0 +1,19 @@
+# Rust build artifacts
+/target/
+*.pdb
+
+# Compiled binaries (build output belongs in target/)
+*.exe
+*.dll
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*.user
