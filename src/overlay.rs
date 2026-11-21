@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
-use std::sync::Once;
+use std::sync::{Arc, Once};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -12,7 +12,6 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::{
     SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -42,6 +41,8 @@ const MENU_CLASS: &str = "GifPinMenu";
 
 pub const WM_WIDGET_CMD: u32 = WM_APP + 1;
 const WM_MENU_CLOSED: u32 = WM_APP + 2;
+/// Posted by the video decode worker when a new frame is ready.
+pub const WM_VIDEO_FRAME: u32 = WM_APP + 3;
 
 pub const CMD_SHOW: usize = 1;
 pub const CMD_HIDE: usize = 2;
@@ -141,8 +142,7 @@ struct Widget {
     surface: LayeredSurface,
     menu: Option<HWND>,
     resize: Option<ResizeDrag>,
-    qpc_freq: i64,
-    start_qpc: i64,
+    video_frame: Arc<Vec<u8>>,
 }
 
 #[derive(Clone, Copy)]
@@ -205,12 +205,10 @@ fn run_widget(
         let x = (work.left + (ww - w) / 2 + off).clamp(work.left, (work.right - w).max(work.left));
         let y = (work.top + (wh - h) / 2 + off).clamp(work.top, (work.bottom - h).max(work.top));
 
-        let mut qpc_freq = 0i64;
-        let _ = QueryPerformanceFrequency(&mut qpc_freq);
-        let mut start_qpc = 0i64;
-        let _ = QueryPerformanceCounter(&mut start_qpc);
-
         let surface = LayeredSurface::new(w, h).ok_or("Cannot create render surface")?;
+        let video_frame = media
+            .video_frame_arc()
+            .unwrap_or_else(|| Arc::new(Vec::new()));
         let state = Box::new(Widget {
             hwnd: HWND::default(),
             id,
@@ -232,8 +230,7 @@ fn run_widget(
             surface,
             menu: None,
             resize: None,
-            qpc_freq: qpc_freq.max(1),
-            start_qpc,
+            video_frame,
         });
         let ptr = Box::into_raw(state);
         let class_name = win32_utils::wide(WIDGET_CLASS);
@@ -259,6 +256,7 @@ fn run_widget(
             }
         };
         (*ptr).hwnd = hwnd;
+        (*ptr).media.set_video_hwnd(hwnd.0 as isize);
 
         render(&mut *ptr);
         let _ = ShowWindow(hwnd, SW_SHOWNA);
@@ -295,7 +293,11 @@ fn blit_current(w: &mut Widget) {
     let (fw, fh) = (w.media.width, w.media.height);
     let scale = win32_utils::dpi_scale(w.hwnd);
     let bytes = w.surface.bytes();
-    win32_utils::blit_frame(w.media.frame(), fw, fh, bytes, w.w as u32, w.h as u32);
+    if w.kind == Kind::Video {
+        win32_utils::blit_frame(&w.video_frame, fw, fh, bytes, w.w as u32, w.h as u32);
+    } else {
+        win32_utils::blit_frame(w.media.frame(), fw, fh, bytes, w.w as u32, w.h as u32);
+    }
     if w.show_bounds {
         // Alpha > 0 across the whole bbox: Windows hit-tests transparent
         // corners again, so they can be grabbed for resizing.
@@ -343,8 +345,8 @@ fn sync_timer(w: &mut Widget) {
         if w.visible && !w.paused {
             match w.kind {
                 Kind::Gif => set_frame_timer(w, w.media.frame_interval_ms()),
-                Kind::Video => set_frame_timer(w, w.media.frame_interval_ms()),
-                Kind::Image => {}
+                // Video frames arrive via WM_VIDEO_FRAME from the decode worker.
+                Kind::Video | Kind::Image => {}
             }
             SetTimer(w.hwnd, 2, 2000, None); // periodic topmost re-assert
         }
@@ -636,20 +638,9 @@ unsafe extern "system" fn widget_wndproc(
                             render(w);
                             set_frame_timer(w, delay);
                         }
-                        Kind::Video => {
-                            let mut now = 0i64;
-                            let _ = QueryPerformanceCounter(&mut now);
-                            let elapsed =
-                                (now - w.start_qpc) * 10_000_000 / w.qpc_freq.max(1);
-                            let (changed, looped) = w.media.video_tick(elapsed);
-                            if looped {
-                                w.start_qpc = now;
-                            }
-                            if changed {
-                                render(w);
-                            }
-                        }
-                        Kind::Image => {}
+                        // Video is decoded on a dedicated worker thread;
+                        // frames arrive as WM_VIDEO_FRAME messages.
+                        Kind::Video | Kind::Image => {}
                     }
                     LRESULT(0)
                 }
@@ -669,6 +660,13 @@ unsafe extern "system" fn widget_wndproc(
                 }
                 _ => DefWindowProcW(hwnd, msg, wparam, lparam),
             }
+        }
+        WM_VIDEO_FRAME => {
+            if let Some(frame) = w.media.video_frame_arc() {
+                w.video_frame = frame;
+                render(w);
+            }
+            LRESULT(0)
         }
         WM_WIDGET_CMD => {
             match wparam.0 {
@@ -728,11 +726,8 @@ unsafe extern "system" fn widget_wndproc(
                 CMD_SET_PAUSED => {
                     let paused = lparam.0 != 0;
                     w.paused = paused;
-                    if !paused && w.kind == Kind::Video {
-                        let mut now = 0i64;
-                        let _ = QueryPerformanceCounter(&mut now);
-                        w.start_qpc =
-                            now - w.media.video_time() * w.qpc_freq / 10_000_000;
+                    if w.kind == Kind::Video {
+                        w.media.set_video_paused(paused);
                     }
                     sync_timer(w);
                 }

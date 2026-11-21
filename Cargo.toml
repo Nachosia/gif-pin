@@ -1,6 +1,6 @@
 [package]
 name = "gif-pin"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 description = "Lightweight Windows 11 always-on-top overlay app for transparent GIFs, images, and MP4 videos"
 license = "MIT"
@@ -13,10 +13,6 @@ rfd = "0.15"
 tray-icon = "0.20"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
-    "Win32_Graphics_Direct3D",
-    "Win32_Graphics_Direct3D11",
-    "Win32_Graphics_Dxgi",
-    "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",

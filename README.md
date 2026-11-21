@@ -6,7 +6,7 @@ Pin independent, floating, always-on-top media widgets — GIFs, images, and MP4
 ## Key Features
 
 - **True Per-Pixel Transparency** — transparent `.gif` and `.png` files float cleanly over games, browsers, and desktop windows with zero background boxes or window borders (layered windows with `UpdateLayeredWindow` / `ULW_ALPHA`).
-- **Multi-Format Support** — smooth looping `.gif`, hardware-accelerated `.mp4` (via native Windows Media Foundation), `.png`, `.jpg`, `.jpeg`, and `.webp`.
+- **Multi-Format Support** — smooth looping `.gif`, seamlessly looping `.mp4` decoded on a dedicated background thread via native Windows Media Foundation, `.png`, `.jpg`, `.jpeg`, and `.webp`.
 - **Effortless Controls** — drag anywhere to move (multi-monitor & DPI-aware), proportional corner resizing with a per-widget **Aspect Ratio Lock** toggle (hold `Shift` for a temporary free stretch), mouse-wheel scaling, per-widget opacity slider (10%–100%), click-through lock mode, a **Show Bounds** edit frame for grabbing fully transparent images, and System Tray integration.
 - **Zero Dependencies** — compiles into a single standalone `gif-pin.exe` (~5 MB). No FFmpeg, no OpenCV, no Python, no runtime installs.
 
@@ -58,7 +58,8 @@ cargo test
 ```
 
 No external C libraries are needed — MP4 decoding uses the Windows Media Foundation
-pipeline built into the OS, with a D3D11 DXGI device manager for hardware acceleration.
+pipeline built into the OS, running on a dedicated per-video decode thread so overlay
+windows never stall, with CPU-accessible RGB32 output for universal driver compatibility.
 
 ## Architecture
 
@@ -67,7 +68,7 @@ pipeline built into the OS, with a D3D11 DXGI device manager for hardware accele
 | `src/main.rs` | Entry point, Media Foundation startup/shutdown, hub bootstrap |
 | `src/ui.rs` | egui dark-mode control hub, tray icon, native file dialogs, drag & drop, mouse-wheel routing hook |
 | `src/overlay.rs` | Widget windows (one thread + message loop each), anchor-based drag/resize, layered right-click menu with opacity slider |
-| `src/media.rs` | GIF/PNG/JPG/WEBP decoding (`image`), MP4 via `IMFSourceReader` + D3D11, audio via `MFCreateAudioRenderer` |
+| `src/media.rs` | GIF/PNG/JPG/WEBP decoding (`image`), MP4 via `IMFSourceReader` on a dedicated decode thread (orientation-correct, seamless looping), audio via `MFCreateAudioRenderer` |
 | `src/win32_utils.rs` | Layered DIB surfaces, premultiplied-alpha presentation, SIMD scaling (`fast_image_resize`), DPI/monitor helpers |
 
 Each widget is a frameless `WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW` window rendered
